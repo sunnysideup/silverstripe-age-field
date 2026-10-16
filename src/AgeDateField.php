@@ -79,13 +79,20 @@ class AgeDateField extends DateField
      * userforms client-side validation block out-of-range dates early.
      * The server-side check in validate() is still the source of truth.
      *
-     * Note: because min/max are real HTML5 constraint attributes, an
-     * out-of-range value makes the browser refuse to submit the form and
-     * show its own built-in message (e.g. "Please enter a value less than
-     * or equal to ..."), completely ignoring AgeErrorMessage/our translated
-     * messages. Field() below adds a small script that keeps the input's
-     * custom validity message (via setCustomValidity()) in sync with our
-     * own messages, so the browser shows *our* text instead of its default.
+     * Note: the userforms front end validates with the jQuery Validate
+     * plugin, which auto-generates "max"/"min" rules from these same
+     * min/max attributes and uses its own built-in messages for them
+     * (e.g. "Please enter a value less than or equal to ..."), completely
+     * ignoring AgeErrorMessage/our translated messages.
+     *
+     * jQuery Validate looks up a per-field override for a rule's message
+     * via jQuery's `.data('msg' + Rule)` (i.e. a "msgMax"/"msgMin" data
+     * entry, conventionally written as data-msg-max/data-msg-min in HTML -
+     * see https://jqueryvalidation.org/validate/#rules). We seed those with
+     * a sensible default here, and Field() below adds a script that keeps
+     * them (via jQuery's data cache, not the raw HTML attribute, since
+     * jQuery Validate reads the cache) in sync with the specific message
+     * (future/too young/too old/between/custom) as the value changes.
      */
     public function getAttributes(): array
     {
@@ -120,14 +127,32 @@ class AgeDateField extends DateField
             $attributes['data-age-msg-custom'] = $customMessage;
         }
 
+        // Sensible static fallback for jQuery Validate's per-field message
+        // override, in case the script below hasn't run yet (e.g. JS disabled).
+        // The script keeps these accurate once a date is actually entered.
+        $fallback = $customMessage !== null
+            ? str_replace('{age}', '', $customMessage)
+            : ($this->minAge !== null && $this->maxAge !== null
+                ? $this->getBetweenMessage()
+                : ($this->minAge !== null ? $this->getTooYoungMessage() : $this->getFutureMessage()));
+        $attributes['data-msg-max'] = $fallback;
+
+        if ($this->maxAge !== null) {
+            $attributes['data-msg-min'] = $customMessage !== null
+                ? str_replace('{age}', '', $customMessage)
+                : ($this->minAge !== null ? $this->getBetweenMessage() : $this->getTooOldMessage());
+        }
+
         return $attributes;
     }
 
     /**
-     * Injects a small script that mirrors getAgeError() in the browser via
-     * setCustomValidity(), so the native HTML5 validation bubble shows our
-     * message (translated / custom AgeErrorMessage) instead of the browser's
-     * generic "Please enter a value less than or equal to ..." text.
+     * Injects a small script that mirrors getAgeError() in the browser and
+     * keeps jQuery Validate's per-field "max"/"min" messages (read via
+     * jQuery's data cache - see getAttributes() above) up to date, so the
+     * userforms front-end validation shows our message (translated / custom
+     * AgeErrorMessage) instead of jQuery Validate's generic built-in text
+     * ("Please enter a value less than or equal to ...").
      */
     public function Field($properties = [])
     {
@@ -152,13 +177,12 @@ class AgeDateField extends DateField
         return isNaN(date.getTime()) ? null : date;
     }
 
-    function checkAgeField(input) {
+    function resolveMessage(input) {
         var value = input.value;
         var dob = parseISODate(value);
 
         if (!dob) {
-            input.setCustomValidity('');
-            return;
+            return '';
         }
 
         var today = new Date();
@@ -166,8 +190,7 @@ class AgeDateField extends DateField
         dob.setHours(0, 0, 0, 0);
 
         if (dob > today) {
-            input.setCustomValidity(input.dataset.ageMsgFuture || '');
-            return;
+            return input.dataset.ageMsgFuture || '';
         }
 
         var minAge = input.dataset.ageMin ? parseInt(input.dataset.ageMin, 10) : null;
@@ -177,22 +200,34 @@ class AgeDateField extends DateField
         var tooOld = maxAge !== null && age > maxAge;
 
         if (!tooYoung && !tooOld) {
-            input.setCustomValidity('');
-            return;
+            return '';
         }
 
-        var message;
         if (input.dataset.ageMsgCustom) {
-            message = input.dataset.ageMsgCustom.replace('{age}', age);
-        } else if (minAge !== null && maxAge !== null) {
-            message = input.dataset.ageMsgBetween;
-        } else if (tooYoung) {
-            message = input.dataset.ageMsgTooYoung;
-        } else {
-            message = input.dataset.ageMsgTooOld;
+            return input.dataset.ageMsgCustom.replace('{age}', age);
         }
 
-        input.setCustomValidity(message || '');
+        if (minAge !== null && maxAge !== null) {
+            return input.dataset.ageMsgBetween || '';
+        }
+
+        return tooYoung
+            ? (input.dataset.ageMsgTooYoung || '')
+            : (input.dataset.ageMsgTooOld || '');
+    }
+
+    function checkAgeField(input) {
+        var message = resolveMessage(input);
+
+        // Native constraint validation (if anything still consults it).
+        input.setCustomValidity(message);
+
+        // jQuery Validate (used by the userforms front end) reads per-field
+        // message overrides from jQuery's data cache, not the raw HTML
+        // attribute, so update it via jQuery(...).data() to keep it live.
+        if (typeof jQuery !== 'undefined') {
+            jQuery(input).data('msgMax', message).data('msgMin', message);
+        }
     }
 
     function init(input) {
