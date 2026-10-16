@@ -50,7 +50,7 @@ class EditableAgeField extends EditableDateField
             // "Default to today" makes no sense for a date of birth.
             $fields->removeByName(['DefaultToToday', 'Default']);
 
-            $fields->addFieldsToTab('Root.Main', [
+            $fields->addFieldsToTab('Root.Validation', [
                 NumericField::create('MinAge', _t(self::class . '.MIN_AGE', 'Minimum age (years)'))
                     ->setHTML5(true)
                     ->setDescription(_t(

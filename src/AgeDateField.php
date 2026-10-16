@@ -9,6 +9,7 @@ use DateTimeZone;
 use SilverStripe\Core\Validation\ValidationResult;
 use SilverStripe\Forms\DateField;
 use SilverStripe\ORM\FieldType\DBDatetime;
+use SilverStripe\View\Requirements;
 
 /**
  * A date-of-birth field that validates the person's age rather than a fixed date.
@@ -77,6 +78,14 @@ class AgeDateField extends DateField
      * Adds HTML5 min/max attributes so the browser's date picker and the
      * userforms client-side validation block out-of-range dates early.
      * The server-side check in validate() is still the source of truth.
+     *
+     * Note: because min/max are real HTML5 constraint attributes, an
+     * out-of-range value makes the browser refuse to submit the form and
+     * show its own built-in message (e.g. "Please enter a value less than
+     * or equal to ..."), completely ignoring AgeErrorMessage/our translated
+     * messages. Field() below adds a small script that keeps the input's
+     * custom validity message (via setCustomValidity()) in sync with our
+     * own messages, so the browser shows *our* text instead of its default.
      */
     public function getAttributes(): array
     {
@@ -98,7 +107,121 @@ class AgeDateField extends DateField
             $attributes['min'] = $earliest->format('Y-m-d');
         }
 
+        $attributes['class'] = trim(($attributes['class'] ?? '') . ' age-date-field');
+        $attributes['data-age-min'] = $this->minAge !== null ? (string) $this->minAge : '';
+        $attributes['data-age-max'] = $this->maxAge !== null ? (string) $this->maxAge : '';
+        $attributes['data-age-msg-future'] = (string) $this->getFutureMessage();
+        $attributes['data-age-msg-between'] = (string) $this->getBetweenMessage();
+        $attributes['data-age-msg-too-young'] = (string) $this->getTooYoungMessage();
+        $attributes['data-age-msg-too-old'] = (string) $this->getTooOldMessage();
+
+        $customMessage = $this->getCustomMessageTemplate();
+        if ($customMessage !== null) {
+            $attributes['data-age-msg-custom'] = $customMessage;
+        }
+
         return $attributes;
+    }
+
+    /**
+     * Injects a small script that mirrors getAgeError() in the browser via
+     * setCustomValidity(), so the native HTML5 validation bubble shows our
+     * message (translated / custom AgeErrorMessage) instead of the browser's
+     * generic "Please enter a value less than or equal to ..." text.
+     */
+    public function Field($properties = [])
+    {
+        if ($this->getHTML5()) {
+            Requirements::customScript(<<<'JS'
+(function () {
+    function wholeYears(dob, today) {
+        var age = today.getFullYear() - dob.getFullYear();
+        var monthDiff = today.getMonth() - dob.getMonth();
+        if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dob.getDate())) {
+            age--;
+        }
+        return age;
+    }
+
+    function parseISODate(value) {
+        if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+            return null;
+        }
+        var parts = value.split('-');
+        var date = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+        return isNaN(date.getTime()) ? null : date;
+    }
+
+    function checkAgeField(input) {
+        var value = input.value;
+        var dob = parseISODate(value);
+
+        if (!dob) {
+            input.setCustomValidity('');
+            return;
+        }
+
+        var today = new Date();
+        today.setHours(0, 0, 0, 0);
+        dob.setHours(0, 0, 0, 0);
+
+        if (dob > today) {
+            input.setCustomValidity(input.dataset.ageMsgFuture || '');
+            return;
+        }
+
+        var minAge = input.dataset.ageMin ? parseInt(input.dataset.ageMin, 10) : null;
+        var maxAge = input.dataset.ageMax ? parseInt(input.dataset.ageMax, 10) : null;
+        var age = wholeYears(dob, today);
+        var tooYoung = minAge !== null && age < minAge;
+        var tooOld = maxAge !== null && age > maxAge;
+
+        if (!tooYoung && !tooOld) {
+            input.setCustomValidity('');
+            return;
+        }
+
+        var message;
+        if (input.dataset.ageMsgCustom) {
+            message = input.dataset.ageMsgCustom.replace('{age}', age);
+        } else if (minAge !== null && maxAge !== null) {
+            message = input.dataset.ageMsgBetween;
+        } else if (tooYoung) {
+            message = input.dataset.ageMsgTooYoung;
+        } else {
+            message = input.dataset.ageMsgTooOld;
+        }
+
+        input.setCustomValidity(message || '');
+    }
+
+    function init(input) {
+        if (input.dataset.ageFieldInitialised) {
+            return;
+        }
+        input.dataset.ageFieldInitialised = '1';
+        checkAgeField(input);
+        input.addEventListener('input', function () { checkAgeField(input); });
+        input.addEventListener('change', function () { checkAgeField(input); });
+    }
+
+    function initAll() {
+        var inputs = document.querySelectorAll('input.age-date-field');
+        for (var i = 0; i < inputs.length; i++) {
+            init(inputs[i]);
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initAll);
+    } else {
+        initAll();
+    }
+})();
+JS, 'sunnysideup-age-field');
+        }
+
+        return parent::Field($properties);
     }
 
     /**
@@ -137,7 +260,7 @@ class AgeDateField extends DateField
         $today = $this->getToday();
 
         if ($dob > $today) {
-            return _t(self::class . '.FUTURE', 'Your date of birth can’t be in the future.');
+            return $this->getFutureMessage();
         }
 
         $age = $dob->diff($today)->y;
@@ -149,37 +272,72 @@ class AgeDateField extends DateField
             return null;
         }
 
-        $placeholders = [
-            '{minAge}' => (string) $this->minAge,
-            '{maxAge}' => (string) $this->maxAge,
-            '{age}' => (string) $age,
-        ];
-
         if ($this->ageErrorMessage !== null) {
-            return strtr($this->ageErrorMessage, $placeholders);
+            return strtr($this->ageErrorMessage, [
+                '{minAge}' => (string) $this->minAge,
+                '{maxAge}' => (string) $this->maxAge,
+                '{age}' => (string) $age,
+            ]);
         }
 
         if ($this->minAge !== null && $this->maxAge !== null) {
-            return _t(
-                self::class . '.BETWEEN',
-                'You must be between {minAge} and {maxAge} years old.',
-                ['minAge' => $this->minAge, 'maxAge' => $this->maxAge]
-            );
+            return $this->getBetweenMessage();
         }
 
         if ($tooYoung) {
-            return _t(
-                self::class . '.TOO_YOUNG',
-                'You must be at least {minAge} years old.',
-                ['minAge' => $this->minAge]
-            );
+            return $this->getTooYoungMessage();
         }
 
+        return $this->getTooOldMessage();
+    }
+
+    protected function getFutureMessage(): string
+    {
+        return _t(self::class . '.FUTURE', 'Your date of birth can’t be in the future.');
+    }
+
+    protected function getBetweenMessage(): string
+    {
+        return _t(
+            self::class . '.BETWEEN',
+            'You must be between {minAge} and {maxAge} years old.',
+            ['minAge' => $this->minAge, 'maxAge' => $this->maxAge]
+        );
+    }
+
+    protected function getTooYoungMessage(): string
+    {
+        return _t(
+            self::class . '.TOO_YOUNG',
+            'You must be at least {minAge} years old.',
+            ['minAge' => $this->minAge]
+        );
+    }
+
+    protected function getTooOldMessage(): string
+    {
         return _t(
             self::class . '.TOO_OLD',
             'You must be {maxAge} years old or younger.',
             ['maxAge' => $this->maxAge]
         );
+    }
+
+    /**
+     * Resolves {minAge}/{maxAge} in the custom AgeErrorMessage ahead of time
+     * (known at render time), leaving {age} for the client-side script to
+     * fill in once a date of birth is entered.
+     */
+    protected function getCustomMessageTemplate(): ?string
+    {
+        if ($this->ageErrorMessage === null) {
+            return null;
+        }
+
+        return strtr($this->ageErrorMessage, [
+            '{minAge}' => (string) $this->minAge,
+            '{maxAge}' => (string) $this->maxAge,
+        ]);
     }
 
     /**
